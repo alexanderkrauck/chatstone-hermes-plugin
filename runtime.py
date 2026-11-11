@@ -128,19 +128,27 @@ def sync(config, *, seconds=25):
     client.ordered = True
     with open_spool(config) as spool:
         initialize(spool, config['source_path'])
-        try:
-            capture_live(spool, config['source_path'])
-        except Exception as error:
-            if str(error) != 'SPOOL_FULL':
-                raise
         legacy = None
         while monotonic()+10 < end:
+            # Recheck on every bounded delivery/history step, not just once per tick.
+            # Drain a multi-chunk live tail before admitting any history.
+            try:
+                capture_live(spool, config['source_path'])
+            except Exception as error:
+                if str(error) != 'SPOOL_FULL':
+                    raise
             status = spool.status()
-            if status['rejected']:
-                raise RuntimeError('DELIVERY_REFUSED')
             if status['pending']:
                 spool.flush(client)
+                refused = spool.status()['errors']
+                if refused:
+                    from chatstone.client.transport import ClientError
+                    raise ClientError(next(iter(refused)))
                 sleep(.1)
+                continue
+            tail = spool._db.execute('SELECT tail FROM hermes_fresh').fetchone()[0]
+            top = bounds(config['source_path'], limit=1)
+            if top and tail < top[0]:
                 continue
             history = spool._db.execute('SELECT remaining,enabled FROM plugin_backfill').fetchone()
             if not all(history):

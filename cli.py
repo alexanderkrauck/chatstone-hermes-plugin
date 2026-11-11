@@ -45,8 +45,9 @@ def login(home):
     folder = root(home)
     if (folder/'credentials.json').exists() or (folder/'enrollment-started.json').exists():
         raise RuntimeError('ALREADY_CONFIGURED_OR_EXCHANGE_UNCERTAIN')
-    old = Path.home()/'.local/share/chatstone/hermes-client'
-    if old.exists():
+    from .migration import discover
+    old = discover()
+    if old is not None:
         adopt(home, old)
         return
     origin = os.environ.get('CHATSTONE_SERVER_URL', 'https://api.chatstone.goedly.com').rstrip('/')
@@ -135,7 +136,11 @@ def handle(args, home):
             if args.action == 'login':
                 login(home)
             elif args.action == 'adopt-daemon':
-                adopt(home, args.daemon_root or Path.home()/'.local/share/chatstone/hermes-client')
+                from .migration import discover
+                old = args.daemon_root or discover()
+                if old is None:
+                    raise RuntimeError('DAEMON_NOT_FOUND')
+                adopt(home, old)
             elif args.action == 'logout':
                 (root(home)/'credentials.json').unlink(missing_ok=True)
                 (root(home)/'enrollment-started.json').unlink(missing_ok=True)
@@ -165,7 +170,11 @@ def handle(args, home):
         allowed = {'ALREADY_CONFIGURED','ALREADY_CONFIGURED_OR_EXCHANGE_UNCERTAIN',
             'DAEMON_FOUND_USE_ADOPT_DAEMON','RUN_HERMES_FIRST','ENROLLMENT_UNAVAILABLE_ASK_FOR_FRESH_CODE',
             'ENROLLMENT_RESPONSE_INVALID','DAEMON_BELONGS_TO_DIFFERENT_HERMES_PROFILE','PLUGIN_BUSY'}
-        message = str(error) if str(error) in allowed else 'Operation unavailable; preserve state and ask support.'
+        from .errors import guidance
+        code = getattr(error, 'code', '')
+        if args.action == 'backfill' and code != 'PLUGIN_BUSY':
+            write_private(root(home)/'status.json', {'last_error': guidance(code)})
+        message = str(error) if str(error) in allowed else guidance(code)
         print('Chatstone: '+message)
         return 1
     return 0

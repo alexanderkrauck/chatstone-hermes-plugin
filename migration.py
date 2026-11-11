@@ -22,17 +22,38 @@ def run(args, *, input=None):
     return result.stdout
 
 
+def discover():
+    base = Path.home()/'.local/share/chatstone'
+    candidates = [p for p in (base/'hermes-client', base/'automatic') if (p/'tick.json').is_file()]
+    if len(candidates) > 1:
+        raise RuntimeError('DAEMON_LAYOUT_AMBIGUOUS_USE_EXPLICIT_ROOT')
+    return candidates[0] if candidates else None
+
+
 def adopt_files(root):
     root = Path(root)
     old = read_private(root/'tick.json')
     Client(old['destination'])
+    credentials = {}
     if old.get('credential_backend') == 'macos-keychain':
         script = ('import json,sys; from chatstone.client.automatic import _config,_credential; '
                   'print(json.dumps({"ingest_token":_credential(_config(sys.argv[1]))}))')
         token = json.loads(run([root/'venv/bin/python', '-c', script, root/'tick.json']))['ingest_token']
     else:
-        token = read_private(Path(old['credential_file']))['ingest_token']
-    read = read_private(root/'search.json')['read_key']
+        credentials = read_private(Path(old['credential_file']))
+        token = credentials['ingest_token']
+    search = root/'search.json'
+    if search.exists():
+        read = read_private(search)['read_key']
+    elif old.get('credential_backend') != 'macos-keychain':
+        # Hand-built VPS layout keeps BOTH keys in its private credential file.
+        read = credentials['read_token']
+        if (credentials.get('host') != old['host'] or credentials.get('base_url') != old['destination']
+                or credentials.get('source') != 'hermes'
+                or credentials.get('install_id') != old['expected_install']):
+            raise RuntimeError('DAEMON_IDENTITY_MISMATCH')
+    else:
+        raise RuntimeError('DAEMON_READ_KEY_MISSING')
     if not all(isinstance(x, str) and TOKEN.fullmatch(x) for x in (token, read)):
         raise RuntimeError('CREDENTIAL_INVALID')
     return {'device': old['host'], 'origin': old['destination'], 'ingest_key': token,
@@ -48,20 +69,28 @@ def stop_scheduler(root):
             '--config', root/'tick.json', '--python', root/'venv/bin/python'])
         return
     units = Path.home()/'.config/systemd/user'
-    paths = [units/f'chatstone-hermes.{suffix}' for suffix in ('service', 'timer')]
-    # Validate all destinations BEFORE stopping or deleting anything.
+    legacy = root.name == 'automatic'
+    prefix = 'chatstone-collector-vps' if legacy else 'chatstone-hermes'
+    paths = [units/f'{prefix}.{suffix}' for suffix in ('service', 'timer')]
+    # Validate all destinations BEFORE stopping or deleting anything. Legacy
+    # clients/<sha> interpreters are allowed; the exact tick config must be bound.
     for path in paths:
-        if path.is_symlink() or (path.exists() and path.suffix == '.service'
-                                and str(root) not in path.read_text()):
+        if path.is_symlink():
             raise RuntimeError('SCHEDULER_CHANGED')
+        if path.exists():
+            text = path.read_text()
+            expected = str(root/'tick.json') if legacy else str(root)
+            if (path.suffix == '.service' and expected not in text) or (
+                    path.suffix == '.timer' and f'Unit={prefix}.service' not in text):
+                raise RuntimeError('SCHEDULER_CHANGED')
     if paths[1].exists():
-        run(['systemctl', '--user', 'disable', '--now', 'chatstone-hermes.timer'])
+        run(['systemctl', '--user', 'disable', '--now', f'{prefix}.timer'])
     if paths[0].exists():
-        run(['systemctl', '--user', 'stop', 'chatstone-hermes.service'])
+        run(['systemctl', '--user', 'disable', '--now', f'{prefix}.service'])
     for path in paths:
         path.unlink(missing_ok=True)
     run(['systemctl', '--user', 'daemon-reload'])
-    for name in ('chatstone-hermes.service', 'chatstone-hermes.timer'):
+    for name in (f'{prefix}.service', f'{prefix}.timer'):
         check = subprocess.run(['systemctl', '--user', 'is-active', '--quiet', name], check=False,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
         if check.returncode not in (3, 4):

@@ -57,8 +57,11 @@ class Worker:
                     previous = read_private(path)
                 except FileNotFoundError:
                     previous = {}
-                previous['last_error'] = ('Sync unavailable; check connectivity, device access '
-                    'and queue with hermes chatstone status.')
+                from .errors import guidance
+                previous['last_error'] = guidance(code)
+                previous['last_error_code'] = code if code in {
+                    'INGEST_CAPACITY_EXCEEDED', 'RATE_LIMITED', 'SERVICE_UNAVAILABLE',
+                    'UNAUTHORIZED', 'FORBIDDEN', 'INGEST_DISABLED', 'DELIVERY_REFUSED'} else 'SYNC_UNAVAILABLE'
                 write_private(path, previous)
         finally:
             self.lock.release()
