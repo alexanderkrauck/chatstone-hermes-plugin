@@ -1,0 +1,9 @@
+name: chatstone
+version: "0.1.0"
+description: "Searchable conversation archive. Reads profile history and sends it to Chatstone over HTTPS."
+author: Chatstone
+hooks:
+  - on_session_start
+  - on_session_end
+  - on_session_finalize
+  - subagent_stop
