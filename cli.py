@@ -169,12 +169,22 @@ def handle(args, home):
     except Exception as error:  # noqa: BLE001 -- no secret exception text
         allowed = {'ALREADY_CONFIGURED','ALREADY_CONFIGURED_OR_EXCHANGE_UNCERTAIN',
             'DAEMON_FOUND_USE_ADOPT_DAEMON','RUN_HERMES_FIRST','ENROLLMENT_UNAVAILABLE_ASK_FOR_FRESH_CODE',
-            'ENROLLMENT_RESPONSE_INVALID','DAEMON_BELONGS_TO_DIFFERENT_HERMES_PROFILE','PLUGIN_BUSY'}
+            'ENROLLMENT_RESPONSE_INVALID','DAEMON_BELONGS_TO_DIFFERENT_HERMES_PROFILE','PLUGIN_BUSY',
+            'DAEMON_NOT_FOUND','DAEMON_IDENTITY_MISMATCH','DAEMON_READ_KEY_MISSING',
+            'CREDENTIAL_INVALID','PRIVATE_FILE_UNSAFE','DAEMON_MIGRATION_FAILED',
+            'DAEMON_LAYOUT_AMBIGUOUS_USE_EXPLICIT_ROOT','SCHEDULER_CHANGED',
+            'DAEMON_STOP_UNVERIFIED','MCP_REMOVAL_FAILED'}
         from .errors import guidance
         code = getattr(error, 'code', '')
         if args.action == 'backfill' and code != 'PLUGIN_BUSY':
             write_private(root(home)/'status.json', {'last_error': guidance(code)})
-        message = str(error) if str(error) in allowed else guidance(code)
+        if str(error) in allowed:
+            message = str(error)
+        elif args.action == 'adopt-daemon':
+            message = ('Adoption failed ('+type(error).__name__+
+                '); nothing was changed unless stated above.')
+        else:
+            message = guidance(code)
         print('Chatstone: '+message)
         return 1
     return 0

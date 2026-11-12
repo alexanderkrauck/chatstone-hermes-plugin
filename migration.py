@@ -5,8 +5,10 @@ Scheduler/MCP removal uses supported platform CLIs and verifies their effects.
 """
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 from chatstone.client.transport import TOKEN, Client
@@ -49,9 +51,15 @@ def adopt_files(root):
         # Hand-built VPS layout keeps BOTH keys in its private credential file.
         read = credentials['read_token']
         if (credentials.get('host') != old['host'] or credentials.get('base_url') != old['destination']
-                or credentials.get('source') != 'hermes'
-                or credentials.get('install_id') != old['expected_install']):
+                or credentials.get('source') != 'hermes'):
             raise RuntimeError('DAEMON_IDENTITY_MISMATCH')
+        # The daemon uploads under tick/spool identity; enrollment metadata can be stale.
+        database = Path(old['spool_path'])/'spool.sqlite3'
+        if database.exists():
+            with closing(sqlite3.connect(database.resolve().as_uri()+'?mode=ro', uri=True)) as db:
+                identity = db.execute('SELECT install FROM identity').fetchone()
+            if identity != (old['expected_install'],):
+                raise RuntimeError('DAEMON_IDENTITY_MISMATCH')
     else:
         raise RuntimeError('DAEMON_READ_KEY_MISSING')
     if not all(isinstance(x, str) and TOKEN.fullmatch(x) for x in (token, read)):
