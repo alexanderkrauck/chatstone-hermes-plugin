@@ -42,6 +42,77 @@ def initialize(spool, source):
             '(id INTEGER PRIMARY KEY CHECK(id=1), remaining INTEGER, admitted INTEGER, enabled INTEGER)')
         # Adoption replays old history through seen fingerprints, not a new identity.
         spool._db.execute('INSERT OR IGNORE INTO plugin_backfill VALUES(1,?,0,0)', (high,))
+        spool._db.execute('CREATE TABLE IF NOT EXISTS plugin_skipped '
+            '(native_id INTEGER PRIMARY KEY, cause TEXT NOT NULL)')
+
+
+def row_failure(error):
+    # Only deterministic source/parse errors can be skipped. Disk, queue,
+    # network, schema and busy/timeout failures leave the cursor untouched.
+    from chatstone.client.transport import ClientError
+    from chatstone.collectors.policy import SourceDenied
+    from chatstone.collectors.wire import RequestError
+    if isinstance(error, RequestError):
+        return True
+    if isinstance(error, SourceDenied):
+        return str(error) == 'SOURCE_ROW_SIZE_LIMIT'
+    if isinstance(error, ClientError):
+        return error.code in ('REQUEST_TOO_LARGE', 'INVALID_REQUEST', 'INVALID_RECORD', 'SOURCE_ROW_SIZE_LIMIT')
+    if isinstance(error, sqlite3.OperationalError):
+        return str(error).startswith('Could not decode to UTF-8')
+    return isinstance(error, (UnicodeError, ValueError, TypeError, KeyError,
+                             OverflowError, RecursionError, sqlite3.DataError)) or (
+        type(error) is RuntimeError and str(error) == 'SOURCE_ROW_MISSING')
+
+
+def capture_id(spool, source, native_id, *, advance=None):
+    from .errors import cause
+    try:
+        selected = list(incremental_rows(Path(source), after=native_id-1, through=native_id, limit=1))
+        if not selected:
+            raise RuntimeError('SOURCE_ROW_MISSING')
+        raw, seq = selected[0]
+        prepared = prepare_row(spool, source, raw, seq)
+    except Exception as error:
+        error.native_id = native_id
+        if not row_failure(error):
+            raise
+        failure = cause(error, native_id=native_id)
+        prepared = None
+    else:
+        failure = None
+    # Cursor/skip ledger or payload/seen commit atomically. Never skip an
+    # admission failure (in particular SPOOL_FULL) or poison seen on failure.
+    try:
+        with spool._transaction():
+            if prepared is not None:
+                spool._add_prepared(prepared)
+                spool._db.execute('DELETE FROM plugin_skipped WHERE native_id=?', (native_id,))
+            else:
+                spool._db.execute('INSERT OR REPLACE INTO plugin_skipped VALUES (?,?)',
+                                  (native_id, json.dumps(failure)))
+            if advance is not None:
+                sql, position = advance
+                if prepared is None:
+                    sql = sql.replace('admitted=admitted+1', 'admitted=admitted')
+                spool._db.execute(sql, (position,))
+    except Exception as error:
+        error.native_id = native_id
+        raise
+    return prepared is not None
+
+
+def retry_skipped(spool, source):
+    # Explicit command only: do not let a permanently bad row consume every tick.
+    ids = [r[0] for r in spool._db.execute('SELECT native_id FROM plugin_skipped ORDER BY native_id DESC')]
+    from chatstone.client.transport import ClientError
+    for native_id in ids:
+        try:
+            capture_id(spool, source, native_id)
+        except ClientError as error:
+            if error.code != 'SPOOL_FULL':
+                raise
+            break  # Let sync drain the queue; remaining skips stay listed.
 
 
 def capture_history(spool, source, *, limit=32):
@@ -51,15 +122,10 @@ def capture_history(spool, source, *, limit=32):
         with spool._transaction():
             spool._db.execute('UPDATE plugin_backfill SET remaining=0 WHERE id=1')
         return 0
-    # Reuse the canonical incremental reader's sequence and selected-field shape.
-    selected = list(incremental_rows(Path(source), after=ids[-1]-1, through=ids[0], limit=limit))
-    for raw, seq in reversed(selected):
-        prepared = prepare_row(spool, source, raw, seq)
-        with spool._transaction():
-            spool._add_prepared(prepared)
-            spool._db.execute('UPDATE plugin_backfill SET remaining=?,admitted=admitted+1 WHERE id=1',
-                (raw['id']-1,))
-    return len(selected)
+    for native_id in ids:
+        capture_id(spool, source, native_id, advance=(
+            'UPDATE plugin_backfill SET remaining=?,admitted=admitted+1 WHERE id=1', native_id-1))
+    return len(ids)
 
 
 def prepare_row(spool, source, raw, seq):
@@ -70,14 +136,38 @@ def prepare_row(spool, source, raw, seq):
         native_role=raw['role'], text=raw['content'] or '', limits=limits,
         native_source=raw['native_source'], parts=parts, warnings=warnings,
         tool_result=(raw['tool_call_id'], raw['tool_name']) if raw['role']=='tool' else None)
-    return spool._prepare(enrich(source, parsed))
+    from chatstone.client.ingest import _wire_record, encode_spool_json
+    from chatstone.collectors.wire import decode_record
+    prepared = spool._prepare(enrich(source, parsed))
+    envelope = json.loads(prepared[3])
+    converted = _wire_record(envelope['records'][0])
+    decode_record(converted)  # Same pure decoder as server, before seen/cursor admission.
+    encode_spool_json({**envelope, 'records': [converted]})
+    return prepared
 
 
 def capture_live(spool, source):
+    # Validate the adopted source binding before any capture.
+    hermes_incremental._position(spool, source)
     remaining = spool._db.execute('SELECT remaining FROM plugin_backfill WHERE id=1').fetchone()[0]
-    # Canonical fresh-tail reader includes attachments and preserves adopted positions.
-    # Its historical ascending sweep must not preempt our explicit descending backfill.
-    return hermes_incremental.capture(spool, source, live_only=bool(remaining))
+    tail = spool._db.execute('SELECT tail FROM hermes_fresh WHERE id=1').fetchone()[0]
+    with sqlite3.connect(Path(source).as_uri()+'?mode=ro', uri=True, timeout=1) as db:
+        ids = [r[0] for r in db.execute('SELECT id FROM messages WHERE id>? ORDER BY id LIMIT 256', (tail,))]
+    for native_id in ids:
+        capture_id(spool, source, native_id, advance=('UPDATE hermes_fresh SET tail=? WHERE id=1', native_id))
+    if remaining or len(ids) == 256:
+        return
+    # Rolling reconciliation includes original attachments, without the old
+    # ascending acquisition preempting newest-first history or a bad row stalling.
+    sweep = spool._db.execute('SELECT sweep FROM hermes_position WHERE id=1').fetchone()[0]
+    with sqlite3.connect(Path(source).as_uri()+'?mode=ro', uri=True, timeout=1) as db:
+        ids = [r[0] for r in db.execute('SELECT id FROM messages WHERE id>? AND id<=? ORDER BY id LIMIT 32',
+                                      (sweep, tail))]
+    for native_id in ids:
+        capture_id(spool, source, native_id, advance=('UPDATE hermes_position SET sweep=? WHERE id=1', native_id))
+    if len(ids) < 32:
+        with spool._transaction():
+            spool._db.execute('UPDATE hermes_position SET sweep=0 WHERE id=1')
 
 
 def open_spool(config):
@@ -100,7 +190,9 @@ def continue_legacy(spool, source):
     status = epoch.status()
     phase = status['phase']
     if phase in ('FAILED', 'EXPIRED'):
-        raise RuntimeError('LEGACY_HISTORY_NEEDS_SUPPORT')
+        # Current history was scanned first; only deleted-local snapshot rows
+        # may remain unavailable. Preserve all files for explicit recovery.
+        return phase
     if phase == 'RETIRED':
         return phase
     if phase == 'RETIRING':
@@ -121,7 +213,7 @@ def continue_legacy(spool, source):
     return epoch.status()['phase']
 
 
-def sync(config, *, seconds=25):
+def sync(config, *, seconds=25, one_step=False):
     from time import monotonic, sleep
     end = monotonic()+seconds
     client = IngestClient(config['origin'], secret_getter=lambda: config['ingest_key'], timeout=10)
@@ -129,7 +221,9 @@ def sync(config, *, seconds=25):
     with open_spool(config) as spool:
         initialize(spool, config['source_path'])
         legacy = None
-        while monotonic()+10 < end:
+        steps = 0
+        while monotonic()+10 < end and (not one_step or steps == 0):
+            steps += 1
             # Recheck on every bounded delivery/history step, not just once per tick.
             # Drain a multi-chunk live tail before admitting any history.
             try:
@@ -154,17 +248,27 @@ def sync(config, *, seconds=25):
             if not all(history):
                 if history[0] == 0:
                     legacy = continue_legacy(spool, config['source_path'])
-                    if legacy not in (None, 'RETIRED'):
+                    if legacy not in (None, 'RETIRED', 'FAILED', 'EXPIRED'):
                         continue
                 break
             capture_history(spool, config['source_path'])
-        result = spool.status()
+        result = snapshot(spool)
         remaining, admitted, enabled = spool._db.execute(
             'SELECT remaining,admitted,enabled FROM plugin_backfill').fetchone()
         result.update(device=config['device'], last_sync=datetime.now(UTC).isoformat(),
             backfill={'remaining_through_id': remaining, 'admitted': admitted, 'enabled': bool(enabled),
                 'legacy_phase': legacy})
+        if legacy in ('FAILED', 'EXPIRED'):
+            result['warning'] = ('Abandoned legacy snapshot '+legacy+
+                '; current database scanned; deleted-local rows may be unavailable. Legacy files retained.')
         return result
+
+
+def snapshot(spool):
+    result = spool.status()
+    result['skipped'] = spool._db.execute('SELECT count(*) FROM plugin_skipped').fetchone()[0]
+    result['fresh_tail'] = spool._db.execute('SELECT tail FROM hermes_fresh WHERE id=1').fetchone()[0]
+    return result
 
 
 def tool_result(config, operation, params):

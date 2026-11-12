@@ -1,5 +1,5 @@
 name: chatstone
-version: "0.1.0"
+version: "0.1.1"
 description: "Searchable conversation archive. Reads profile history and sends it to Chatstone over HTTPS."
 author: Chatstone
 hooks:

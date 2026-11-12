@@ -2,7 +2,7 @@
 import threading
 import time
 
-from .config import load, read_private, root, write_private
+from .config import load, root
 from .runtime import sync
 
 
@@ -44,24 +44,21 @@ class Worker:
             time.sleep(.5)
             with lease(self.home):
                 value = sync(load(self.home))
-                value['last_error'] = None
-                write_private(root(self.home)/'status.json', value)
+                from .cli import save_success
+                save_success(self.home, value)
             self.failures = 0
         except Exception as error:  # noqa: BLE001 -- no private exception text
             code = getattr(error, 'code', '')
             if code not in ('SPOOL_BUSY', 'PLUGIN_BUSY'):
                 self.failures += 1
                 self.next_retry = time.monotonic()+min(300, 2**min(self.failures, 8))
-                path = root(self.home)/'status.json'
-                try:
-                    previous = read_private(path)
-                except FileNotFoundError:
-                    previous = {}
-                from .errors import guidance
-                previous['last_error'] = guidance(code)
-                previous['last_error_code'] = code if code in {
-                    'INGEST_CAPACITY_EXCEEDED', 'RATE_LIMITED', 'SERVICE_UNAVAILABLE',
-                    'UNAUTHORIZED', 'FORBIDDEN', 'INGEST_DISABLED', 'DELIVERY_REFUSED'} else 'SYNC_UNAVAILABLE'
-                write_private(path, previous)
+            import sys
+
+            from .errors import cause, describe, save_failure
+            print('Chatstone: '+describe(cause(error)), file=sys.stderr)
+            try:
+                save_failure(self.home, error)
+            except Exception as saving_error:  # noqa: BLE001 -- content-free fallback
+                print('Chatstone status write: '+describe(cause(saving_error)), file=sys.stderr)
         finally:
             self.lock.release()
