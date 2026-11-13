@@ -1,5 +1,6 @@
 ---
 name: search
+license: MIT
 description: Search archived conversations using Chatstone native read tools.
 ---
 Use chatstone_search_messages when the user refers to an earlier conversation,

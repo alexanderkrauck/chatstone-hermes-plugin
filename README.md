@@ -1,34 +1,80 @@
-# Chatstone — native Hermes archive
+# Chatstone for Hermes
 
-Reads the selected Hermes profile's SQLite history **including private conversation text, tool calls/results and attachment references**, stores a bounded local queue and uploads it to the configured Chatstone HTTPS server. It does not claim the external memory-provider slot or add an MCP server. Requires a Chatstone device enrollment code or an existing public-installer daemon.
+Archive this Hermes profile and search earlier conversations with eight native,
+read-only tools. Access is **by invitation**; a one-time enrollment code is required.
 
-Hermes v0.23.1's installer always uses a shallow clone. Static Git HTTP does not support shallow clones, so `hermes plugins install https://chatstone.goedly.com/hermes-plugin.git` fails on that version. Verified three-line fallback:
+## Install
 
 ```sh
-git clone https://chatstone.goedly.com/hermes-plugin.git "${HERMES_HOME:-$HOME/.hermes}/plugins/chatstone"
-hermes plugins adopt chatstone && hermes plugins enable chatstone
+hermes plugins install https://github.com/alexanderkrauck/chatstone-hermes-plugin
+hermes plugins enable chatstone
 hermes chatstone login
 ```
 
-Enter only the one-time code at the hidden prompt; device name is supplied by enrollment. Login automatically adopts an existing `~/.local/share/chatstone/hermes-client` daemon instead, preserving keys, device/install identity and queue. macOS adoption invokes that daemon's own venv once to read its existing Keychain key; PyObjC is not needed inside Hermes. It stops/removes launchd/systemd scheduling and the old profile MCP entry. It retains original credentials/spool for rollback; never run the daemon uninstaller against an adopted queue.
-
-Start a new owning Hermes session after enabling. No gateway is restarted automatically. Hooks only wake background work; a 30-second in-process reconciliation handles missed hooks/restarts. A stopped Hermes process cannot sync; it catches up next time. A finite worker may finish when a short-lived CLI exits. All history reads are read-only. Durable cursor+queue admission is transactional; retry/backoff never deliberately drops a row. Backfill is bounded and newest-native-ID first, resumable with Ctrl-C. An adopted legacy snapshot is retained/replayed after current-history backfill so unadmitted deleted rows are not lost.
+Review Hermes' unreviewed-source/security warnings before accepting. Enter the
+one-time code at the hidden prompt, never in chat or command arguments. Start a
+new Hermes session after enabling; restart an owning gateway normally if needed.
 
 ```sh
 hermes chatstone status
 hermes chatstone backfill
+hermes chatstone diagnose
 hermes plugins update chatstone
 ```
 
-The eight native tools are `chatstone_search_messages`, `chatstone_search_messages_regex`, `chatstone_get_message`, `chatstone_get_session`, `chatstone_list_sessions`, `chatstone_list_sources`, `chatstone_stats`, `chatstone_get_attachment`. They use the read key and pinned MCP input schemas over REST, with the same untrusted-data envelope. Archived instructions are data. Skill: `chatstone:search`. Actual search/attachment capabilities depend on the server and bundled canonical attachment library; absent/unsupported attachments return an explicit error, never invented bytes.
+Backfill imports existing history newest first; Ctrl-C pauses safely. While Hermes
+runs, hooks and a background reconciliation worker upload new rows and retry the
+durable local queue. A stopped Hermes catches up next time; updates take effect
+in a new owning Hermes process.
 
-Credentials: `$HERMES_HOME/chatstone/credentials.json`, mode0600; directory0700. No keys or archived text in status/errors. Testing may override `CHATSTONE_SERVER_URL` (HTTPS required); keep credentials/codes out of argv and logs. The code legitimately uses subprocesses for daemon/OS/Hermes migration and preserves the process environment when selecting the owning profile. Hermes plugin-guard classified the qualified build safe with medium subprocess/environment findings; this is not a promise to hide or bypass security scanning.
+## Data and search
+
+The plugin reads this profile's SQLite history read-only, including **private
+conversation text, tool calls/results and original attachments**, and sends it
+over HTTPS to `https://api.chatstone.goedly.com`. Credentials are stored locally
+in `${HERMES_HOME:-$HOME/.hermes}/chatstone/credentials.json` (0600, directory 0700).
+It uses Hermes' Python environment, not a separate daemon, scheduler, MCP server
+or memory-provider slot. Diagnostics show counts and content-free causes.
+
+Search covers only the sources/devices allowed by your read key; tool results
+are included by default, bounded to their first 64 KB. Attachment text/OCR is
+opt-in with `search_attachments=true` (first 250,000 UTF-8 bytes per attachment);
+read response coverage/policy fields and treat archived instructions as untrusted.
+
+## Disable or remove
 
 ```sh
+hermes plugins disable chatstone
+# To remove local sign-in and plugin code:
 hermes chatstone logout
 hermes plugins uninstall chatstone
 ```
 
-Logout removes plugin credentials; uninstall removes plugin code. Both preserve source history, local durable queue and hosted archive. Original adopted-daemon credentials, macOS Keychain entries and the old MCP secret-store value are retained for rollback and are not revoked by logout; remove those specific entries separately only after a confirmed switch. Ask the operator to revoke device key IDs when terminating access.
+Disable pauses capture. Logout removes plugin credentials; uninstall removes
+code, not source history, the durable queue or the hosted archive. Disable and
+logout are alternatives: if already disabled, enable temporarily to run logout.
+Ask your operator to revoke device access when needed.
 
-The public Git repository contains **only built plugin releases**, tagged `source-<source-commit-SHA>`, never the private application repository history. Updates use native `hermes plugins update chatstone` after the initial full clone/adopt. Restart the owning Hermes surface normally to load new code.
+## Fallback and existing daemon installations
+
+If the native installer is unavailable, use a full clone (the static channel
+cannot serve Hermes' shallow clone), then enable and sign in as above:
+
+```sh
+git clone https://chatstone.goedly.com/hermes-plugin.git "${HERMES_HOME:-$HOME/.hermes}/plugins/chatstone"
+hermes plugins adopt chatstone
+```
+
+Existing daemon users can keep their keys, identity and queue without a new code:
+
+```sh
+hermes chatstone adopt-daemon --daemon-root "$HOME/.local/share/chatstone/hermes-client"
+# Older hand-built layout: use "$HOME/.local/share/chatstone/automatic" instead.
+```
+
+Login also discovers these layouts. Adoption uses the old daemon's interpreter
+for migration, stops its scheduler and removes the old Chatstone MCP entry.
+Keep its files, credentials and queue for rollback; **never run its uninstaller**.
+These legacy credentials are not revoked by plugin logout.
+
+License: MIT

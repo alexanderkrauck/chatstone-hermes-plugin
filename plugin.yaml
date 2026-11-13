@@ -1,8 +1,18 @@
 name: chatstone
-version: "0.1.2"
+version: "0.1.3"
+license: MIT
 description: "Searchable conversation archive. Reads profile history and sends it to Chatstone over HTTPS."
 author: Chatstone
-hooks:
+provides_tools:
+  - chatstone_search_messages
+  - chatstone_search_messages_regex
+  - chatstone_get_message
+  - chatstone_get_session
+  - chatstone_list_sessions
+  - chatstone_list_sources
+  - chatstone_stats
+  - chatstone_get_attachment
+provides_hooks:
   - on_session_start
   - on_session_end
   - on_session_finalize
