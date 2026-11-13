@@ -14,6 +14,25 @@ if VENDOR.is_dir() and str(VENDOR) not in sys.path:
     sys.path.insert(0, str(VENDOR))
 
 
+def _one_shot_cli():
+    # Discovery also runs while Hermes builds plugin-command parsers. Skip global
+    # option values (including profiles) so a prompt/model named chatstone is not
+    # mistaken for our command. No imports from Hermes's private CLI parser.
+    values = {'-p', '--profile', '-z', '--oneshot', '-m', '--model', '--provider',
+              '--reasoning', '-t', '--toolsets', '-r', '--resume', '-s', '--skills',
+              '--usage-file', '--in', '--cpu-profile', '-c', '--continue'}
+    args = iter(sys.argv[1:])
+    for arg in args:
+        if arg == '--':
+            return next(args, None) == 'chatstone'
+        if arg.split('=', 1)[0] in values:
+            if '=' not in arg:
+                next(args, None)
+        elif not arg.startswith('-'):
+            return arg == 'chatstone'
+    return False
+
+
 def register(ctx):
     from hermes_constants import get_hermes_home
 
@@ -22,11 +41,13 @@ def register(ctx):
     from .runtime import tool_result
     from .worker import Worker
     home = get_hermes_home()  # Capture owning profile, never resolve in a background thread.
-    worker = Worker(home)
-    # Start reconciliation even if Hermes restarts without a session hook.
-    worker.start()
-    for event in ('on_session_start', 'on_session_end', 'on_session_finalize', 'subagent_stop'):
-        ctx.register_hook(event, worker.kick)
+    if not _one_shot_cli():
+        worker = Worker(home)
+        # The app/gateway reconciles even without a session hook; one-shot CLI
+        # actions own their lease and sync, so must not spawn a competing worker.
+        worker.start()
+        for event in ('on_session_start', 'on_session_end', 'on_session_finalize', 'subagent_stop'):
+            ctx.register_hook(event, worker.kick)
     ctx.register_cli_command('chatstone', help='Chatstone archive login, history and status',
         setup_fn=setup, handler_fn=lambda args: handle(args, home))
     schemas = json.loads((Path(__file__).parent/'schemas.json').read_text())

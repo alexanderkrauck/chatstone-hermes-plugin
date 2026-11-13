@@ -7,6 +7,8 @@ import re
 from contextlib import contextmanager
 from pathlib import Path
 
+BUSY_CODES = frozenset({'PLUGIN_BUSY', 'SPOOL_BUSY'})
+
 # Only fixed local RuntimeError codes are eligible; never arbitrary message text.
 LOCAL_CODES = frozenset({
     'ALREADY_CONFIGURED', 'ALREADY_CONFIGURED_OR_EXCHANGE_UNCERTAIN',
@@ -67,6 +69,8 @@ def status_lock(home):
 
 
 def save_failure(home, error):
+    if getattr(error, 'code', None) in BUSY_CODES:
+        return None
     from .config import read_private, root, write_private
     value = cause(error)
     path = root(home)/'status.json'

@@ -48,10 +48,11 @@ class Worker:
                 save_success(self.home, value)
             self.failures = 0
         except Exception as error:  # noqa: BLE001 -- no private exception text
-            code = getattr(error, 'code', '')
-            if code not in ('SPOOL_BUSY', 'PLUGIN_BUSY'):
-                self.failures += 1
-                self.next_retry = time.monotonic()+min(300, 2**min(self.failures, 8))
+            from .errors import BUSY_CODES
+            if getattr(error, 'code', None) in BUSY_CODES:
+                return  # Another owner is working; retry on the normal next tick.
+            self.failures += 1
+            self.next_retry = time.monotonic()+min(300, 2**min(self.failures, 8))
             import sys
 
             from .errors import cause, describe, save_failure

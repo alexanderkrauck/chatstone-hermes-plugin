@@ -118,13 +118,16 @@ def status(home):
 
 
 def save_success(home, value):
-    from .errors import status_lock
+    from .errors import BUSY_CODES, status_lock
     with status_lock(home):
         try:
             previous = read_private(root(home)/'status.json')
         except FileNotFoundError:
             previous = {}
-        value.update(last_error=None, last_error_code=None, last_cause=previous.get('last_cause'))
+        last_cause = previous.get('last_cause')
+        if last_cause and last_cause.get('code') in BUSY_CODES:
+            last_cause = None  # Discard contention recorded by older releases.
+        value.update(last_error=None, last_error_code=None, last_cause=last_cause)
         write_private(root(home)/'status.json', value)
 
 
@@ -227,7 +230,9 @@ def handle(args, home):
         print('Paused; durable queue/position retained. Rerun backfill to resume.')
         return 130
     except Exception as error:  # noqa: BLE001 -- no secret exception text
-        from .errors import cause, describe, guidance, save_failure
+        from .errors import BUSY_CODES, cause, describe, guidance, save_failure
+        if getattr(error, 'code', None) in BUSY_CODES:
+            return 0  # An existing sync owner will keep draining the live tail.
         value = cause(error)
         try:
             save_failure(home, error)
