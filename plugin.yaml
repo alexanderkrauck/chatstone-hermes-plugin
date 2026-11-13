@@ -1,5 +1,5 @@
 name: chatstone
-version: "0.1.7"
+version: "0.1.8"
 license: MIT
 description: "Searchable conversation archive. Reads profile history and sends it to Chatstone over HTTPS."
 author: Chatstone

@@ -8,8 +8,13 @@ decision or tool result. Start with a distinctive lexical phrase; scope by host,
 source, session or dates when useful. Use chatstone_search_messages_regex only
 for patterns and supply its required bounded scope. Tool results are searchable
 by default, including role=tool, but only the first 65,536 bytes (64 KB) of each.
-Deep search does not search tool tails. Counts/facets are exact within the declared
-searchable_universe/index_policy; retain those fields and TOOL_CONTENT_PREFIX_ONLY.
+Deep search does not search tool tails. There is no language stemming: search a word
+prefix (arriv for arrived/arriving); use regex for irregular forms. Words are AND-ed;
+quoted phrases are literal. Counts are lower bounds unless total_count_exact and
+raw_count_exact are true; facets_exact=false omits whole-result facets. Preserve
+searchable_universe/index_policy and TOOL_CONTENT_PREFIX_ONLY. partial=true means
+the time or byte budget ended with valid hits, possibly a short/empty page; continue
+next_cursor when supplied. Without a cursor, narrow the scope or retry.
 Use has_attachments=true/false to filter retained originals. Originals are retrievable
 with get_attachment. Set search_attachments=true to include bounded extracted text
 and local German/English Tesseract OCR (images and scanned/image-only PDF pages).
