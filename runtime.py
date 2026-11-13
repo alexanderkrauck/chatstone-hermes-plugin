@@ -42,6 +42,13 @@ def initialize(spool, source):
             '(id INTEGER PRIMARY KEY CHECK(id=1), remaining INTEGER, admitted INTEGER, enabled INTEGER)')
         # Adoption replays old history through seen fingerprints, not a new identity.
         spool._db.execute('INSERT OR IGNORE INTO plugin_backfill VALUES(1,?,0,0)', (high,))
+        spool._db.execute('CREATE TABLE IF NOT EXISTS plugin_metadata '
+            '(id INTEGER PRIMARY KEY CHECK(id=1), cursor INTEGER, total INTEGER, done INTEGER, passes INTEGER)')
+        with sqlite3.connect(Path(source).as_uri()+'?mode=ro', uri=True, timeout=1) as db:
+            total = db.execute('SELECT count(*) FROM sessions').fetchone()[0]
+        spool._db.execute('INSERT OR IGNORE INTO plugin_metadata VALUES(1,0,?,0,0)', (total,))
+        spool._db.execute('CREATE TABLE IF NOT EXISTS plugin_session_seen '
+            '(native_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)')
         spool._db.execute('CREATE TABLE IF NOT EXISTS plugin_skipped '
             '(native_id INTEGER PRIMARY KEY, cause TEXT NOT NULL)')
 
@@ -244,12 +251,16 @@ def sync(config, *, seconds=25, one_step=False):
             top = bounds(config['source_path'], limit=1)
             if top and tail < top[0]:
                 continue
+            # Live delivery above always wins; metadata precedes optional old messages.
+            metadata_more = sync_metadata(spool, config['source_path'], client)
             history = spool._db.execute('SELECT remaining,enabled FROM plugin_backfill').fetchone()
             if not all(history):
                 if history[0] == 0:
                     legacy = continue_legacy(spool, config['source_path'])
                     if legacy not in (None, 'RETIRED', 'FAILED', 'EXPIRED'):
                         continue
+                if metadata_more:
+                    continue
                 break
             capture_history(spool, config['source_path'])
         result = snapshot(spool)
@@ -264,8 +275,50 @@ def sync(config, *, seconds=25, one_step=False):
         return result
 
 
+def sync_metadata(spool, source, client, *, limit=64):
+    """One resumable metadata batch, acknowledged fingerprints only; no messages.
+
+    Repeat the scan because Hermes has no trustworthy metadata update clock.
+    Missing server sessions are not acknowledged and are retried on the next pass.
+    """
+    import hashlib
+
+    from chatstone.collectors.hermes import session_metadata
+    from chatstone.collectors.normalization import canonical
+    cursor, total, done, passes = spool._db.execute(
+        'SELECT cursor,total,done,passes FROM plugin_metadata').fetchone()
+    if done >= total:
+        cursor, done = 0, 0
+        with sqlite3.connect(Path(source).as_uri()+'?mode=ro', uri=True, timeout=1) as db:
+            total = db.execute('SELECT count(*) FROM sessions').fetchone()[0]
+    rows = session_metadata(Path(source), after=cursor, limit=limit)
+    changed = []
+    for rowid, payload in rows:
+        fingerprint = hashlib.sha256(canonical(payload)).hexdigest()
+        seen = spool._db.execute('SELECT fingerprint FROM plugin_session_seen WHERE native_id=?',
+                                 (payload['native_session_id'],)).fetchone()
+        if seen != (fingerprint,):
+            changed.append((payload, fingerprint))
+    applied = set()
+    if changed:
+        receipt = client.update_sessions(install_id=spool.install_id, sessions=[p for p,f in changed])
+        applied = set(receipt['applied'])
+    complete = len(rows) < limit or done+len(rows) >= total
+    with spool._transaction():
+        for payload, fingerprint in changed:
+            if payload['native_session_id'] in applied:
+                spool._db.execute('INSERT OR REPLACE INTO plugin_session_seen VALUES(?,?)',
+                                  (payload['native_session_id'], fingerprint))
+        spool._db.execute('UPDATE plugin_metadata SET cursor=?,total=?,done=?,passes=?',
+            (rows[-1][0] if rows else cursor, total, total if complete else done+len(rows),
+             passes+int(complete)))
+    return not complete
+
+
 def snapshot(spool):
     result = spool.status()
+    total, done, passes = spool._db.execute('SELECT total,done,passes FROM plugin_metadata').fetchone()
+    result['metadata'] = {'remaining': max(0,total-done), 'scanned': done, 'total': total, 'passes': passes}
     result['skipped'] = spool._db.execute('SELECT count(*) FROM plugin_skipped').fetchone()[0]
     result['fresh_tail'] = spool._db.execute('SELECT tail FROM hermes_fresh WHERE id=1').fetchone()[0]
     return result

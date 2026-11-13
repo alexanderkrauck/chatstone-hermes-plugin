@@ -241,3 +241,85 @@ def _frozen_rows(connection, locators, deadline):
         if time.monotonic() >= deadline:
             raise SourceDenied('SOURCE_READ_TIMEOUT')
         yield locator, dict(zip((*_FIELDS, 'native_source'), row, strict=True))
+
+
+# Explicit human surfaces (gateway.session_policy.SURFACES and Platform values).
+# A parent also denotes compression continuation: it never implies subagent.
+_HUMAN_SOURCES = frozenset({'cli', 'tui', 'gui', 'desktop', 'acp', 'telegram', 'discord',
+    'slack', 'whatsapp', 'signal', 'matrix', 'sms', 'email', 'teams', 'msteams',
+    'mattermost', 'feishu', 'dingtalk', 'wecom', 'qq', 'wechat', 'line', 'imessage',
+    'irc', 'web', 'dashboard'})
+_SESSION_FIELDS = ('id', 'source', 'created_source', 'chat_type', 'origin_json', 'title',
+    'model', 'cwd', 'git_repo_root', 'parent_session_id', 'started_at', 'ended_at',
+    'end_reason', 'title_source')
+
+
+def session_kind(source, created_source, platform=None):
+    labels = {source, created_source, platform}
+    if 'subagent' in labels:
+        return 'subagent'
+    if 'cron' in labels:
+        return 'scheduled'
+    # Internal labels must not be laundered by a later surface/accounting label.
+    if labels & {'tool', 'api_server', 'oneshot', 'bot_room', 'a2a'}:
+        return 'other'
+    return 'interactive' if labels & _HUMAN_SOURCES else 'other'
+
+
+def _session_text(value):
+    if not isinstance(value, str):
+        return None
+    return value.replace('\x00', '').encode('utf-8')[:4096].decode('utf-8', errors='ignore')
+
+
+def _session_time(value):
+    from datetime import UTC, datetime
+    try:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, UTC).isoformat()
+        stamp = datetime.fromisoformat(value)
+        return stamp.isoformat() if stamp.utcoffset() is not None else None
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def session_metadata(db_path: Path, *, after=0, limit=64):
+    """Bounded rowid-ordered metadata read; no message bodies or private origin IDs.
+
+    Older Hermes schemas omit new columns. The source is never written/checkpointed.
+    Returns (rowid, payload) for durable reconciliation without changing message hashes.
+    """
+    db_path = checked_path(db_path)
+    with sqlite3.connect(db_path.as_uri()+'?mode=ro', uri=True, timeout=1) as db:
+        db.execute('PRAGMA query_only=ON')
+        db.execute('PRAGMA trusted_schema=OFF')
+        columns = {r[1] for r in db.execute('PRAGMA table_info(sessions)')}
+        if not {'id', 'source'} <= columns:
+            raise SourceDenied('HERMES_SCHEMA_UNSUPPORTED')
+        selected = ','.join(f'substr("{name}",1,4096)' if name in columns
+            and name not in ('started_at','ended_at') else f'"{name}"' if name in columns
+            else 'NULL' for name in _SESSION_FIELDS)
+        deadline = time.monotonic()+2
+        db.set_progress_handler(lambda: int(time.monotonic()>=deadline), 1000)
+        rows = db.execute(f'SELECT rowid,{selected} FROM sessions WHERE rowid>? ORDER BY rowid LIMIT ?',
+                          (after, min(64, limit))).fetchall()
+    result = []
+    for rowid, *values in rows:
+        raw = dict(zip(_SESSION_FIELDS, values, strict=True))
+        try:
+            origin = json.loads(raw['origin_json'] or '{}')
+        except (ValueError, RecursionError):
+            origin = {}
+        platform = origin.get('platform') if isinstance(origin, dict) else None
+        meta = {k: _session_text(raw[k]) for k in
+                ('source', 'created_source', 'chat_type', 'end_reason', 'title_source')}
+        meta['platform'] = _session_text(platform)
+        result.append((rowid, {'native_session_id': _session_text(raw['id']),
+            'kind': session_kind(raw['source'], raw['created_source'], _session_text(platform)),
+            'title': _session_text(raw['title']), 'model': _session_text(raw['model']),
+            'cwd': _session_text(raw['cwd']), 'project': _session_text(raw['git_repo_root']),
+            'started_at': _session_time(raw['started_at']), 'ended_at': _session_time(raw['ended_at']),
+            'parent_native_id': _session_text(raw['parent_session_id']), 'meta': meta}))
+    return result

@@ -109,6 +109,9 @@ def status(home):
     print('Spool: '+json.dumps(counts, sort_keys=True))
     print('Backfill: '+str(row[1])+' admitted; remaining through native ID '+str(row[0])+
           (' (enabled)' if row[2] else ' (not started)'))
+    metadata = counts['metadata']
+    print('Session metadata: '+str(metadata['scanned'])+'/'+str(metadata['total'])+
+          ' scanned; remaining '+str(metadata['remaining'])+'; passes '+str(metadata['passes']))
     print('Legacy phase: '+str(phase or 'none'))
     print('Last error: '+str(saved.get('last_error') or 'none'))
     from .errors import describe
@@ -224,6 +227,7 @@ def handle(args, home):
                     print('Backfill: '+str(progress['admitted'])+' admitted; remaining through ID '+
                         str(progress['remaining_through_id'])+'; pending '+str(result['pending']), flush=True)
                     if (not progress['remaining_through_id'] and not result['pending']
+                            and not result['metadata']['remaining']
                             and progress.get('legacy_phase') in (None, 'RETIRED', 'FAILED', 'EXPIRED')):
                         break
     except KeyboardInterrupt:

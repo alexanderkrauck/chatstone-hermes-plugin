@@ -115,6 +115,10 @@ class IngestClient(Client):
         return self._request('/api/v1/ingest/sources', encode_json({
             'install_id': identity(install_id), 'source': source, 'host': host}), deadline=deadline)
 
+    def update_sessions(self, *, install_id, sessions, deadline=None):
+        return self._request('/api/v1/ingest/sessions', encode_json({
+            'install_id': identity(install_id), 'sessions': sessions}), deadline=deadline)
+
     def _stage_attachments(self, install_id, records, deadline):
         result = []
         for value in records:

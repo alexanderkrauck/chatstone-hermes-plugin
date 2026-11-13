@@ -22,6 +22,8 @@ include_extracted_text=true by default, max_text_chars=20000 (maximum50000).
 OCR can misrecognize words; null confidence is unknown, not a quality guarantee.
 Read a selected hit with chatstone_get_message; reconstruct its thread with
 chatstone_get_session. Preserve source/host/session/message provenance in answers.
+Find chats with chatstone_list_sessions(kind=interactive, title=<substring>, host=<device>, source=hermes).
+Use started_from/to, ended_from/to and has_parent; get_session returns title, kind, model, times, parent and origin meta.
 Page with next_cursor until has_more=false before claiming exhaustive results;
 exact total_count is not the number of rows on the current page. list_sources
 and stats show coverage, not proof of all local history being present. Never
