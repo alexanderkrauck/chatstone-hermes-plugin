@@ -252,6 +252,10 @@ def sync(config, *, seconds=25, one_step=False):
             if top and tail < top[0]:
                 continue
             # Live delivery above always wins; metadata precedes optional old messages.
+            # Fresh enrollment may have history but no source registration yet.
+            # Empty flush binds the install without creating/moving any messages.
+            if spool._registration is None:
+                spool.flush(client)
             metadata_more = sync_metadata(spool, config['source_path'], client)
             history = spool._db.execute('SELECT remaining,enabled FROM plugin_backfill').fetchone()
             if not all(history):
