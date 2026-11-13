@@ -43,7 +43,9 @@ class PublicSmoke(unittest.TestCase):
 
         from chatstone.client.spool import Spool
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            # Darwin's temporary root traverses /var -> /private/var. Give the
+            # trusted fixture its canonical path; keep Spool's symlink refusal.
+            root = Path(temporary).resolve()
             source = root/'state.db'
             with sqlite3.connect(source) as db:
                 db.executescript('CREATE TABLE sessions(id TEXT PRIMARY KEY,source TEXT);'
