@@ -84,12 +84,18 @@ def _worker(writer, path, sample=None):
 
 
 def _decode(data):
+    from .hermes import _valid_native_input
+
     raw = json.loads(data)
     if type(raw) is not dict:
         raise SourceDenied('HERMES_SOURCE_INVALID')
-    # SQLite scalar columns have no native dict type. Restore only our explicit
-    # canonical BLOB tag; ordinary JSON-looking TEXT remains an ordinary string.
+    # Restore only our closed generated evidence object and canonical BLOB tag;
+    # ordinary JSON-looking source TEXT remains an ordinary string.
     for key, value in raw.items():
+        if key == 'native_input':
+            if not _valid_native_input(value):
+                raise SourceDenied('HERMES_SOURCE_INVALID')
+            continue
         if isinstance(value, dict):
             if set(value) != {'$bytes_hex'} or not isinstance(value['$bytes_hex'], str):
                 raise SourceDenied('HERMES_SOURCE_INVALID')

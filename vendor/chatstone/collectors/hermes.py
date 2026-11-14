@@ -13,6 +13,7 @@ import sqlite3
 import stat
 import time
 from collections import defaultdict
+from itertools import islice
 from pathlib import Path
 
 from .binary import text_digest
@@ -25,6 +26,197 @@ _FIELDS = (
     "timestamp", "reasoning", "reasoning_content", "reasoning_details",
     "codex_reasoning_items", "message_uid", "active", "compacted", "api_content",
 )
+
+
+# Keep the legacy scalar projection frozen; capture facts are strictly optional.
+_INPUT_FIELDS = ('_compressed_summary', 'display_kind', 'platform_message_id')
+_DISPLAY_KINDS = frozenset({'hidden', 'steer', 'internal_notification', 'process_complete',
+    'async_delegation_complete', 'model_switch', 'personality_switch', 'failed_turn'})
+_INPUT_PLATFORMS = frozenset({'local', 'telegram', 'discord', 'whatsapp', 'whatsapp_cloud',
+    'slack', 'signal', 'mattermost', 'matrix', 'email', 'sms', 'dingtalk', 'api_server',
+    'webhook', 'msgraph_webhook', 'feishu', 'wecom', 'wecom_callback', 'weixin',
+    'bluebubbles', 'qqbot', 'relay', 'irc', 'teams'})
+_ADMISSION_BYTES = 256 * 1024
+
+
+def _locator(value):
+    # Never coerce, truncate or normalize an identifier used in an exact join.
+    try:
+        return (isinstance(value, str) and 0 < len(value) <= 1024
+                and all(c.isprintable() for c in value) and len(value.encode('utf-8')) <= 4096)
+    except UnicodeEncodeError:
+        return False
+
+
+def _valid_native_input(value):
+    """Closed transport shape; arbitrary source JSON dictionaries remain invalid."""
+    required = {'basis', 'join', 'request_id', 'message_uid', 'intent', 'platform',
+                'internal', 'automation'}
+    return (isinstance(value, dict) and required <= value.keys()
+            and value.keys() <= required | {'sender_id', 'source_is_bot'}
+            and value['basis'] == 'hermes.native_text_v1'
+            and value['join'] == 'same_session_request_id_message_uid'
+            and all(_locator(value[k]) for k in ('request_id', 'message_uid'))
+            and value['intent'] in ('queue', 'steer', 'redirect')
+            and isinstance(value['platform'], str) and value['platform'] in _INPUT_PLATFORMS
+            and type(value['internal']) is bool and type(value['automation']) is bool
+            and value['internal'] == value['automation']
+            and ('sender_id' not in value or _locator(value['sender_id']))
+            and ('source_is_bot' not in value or type(value['source_is_bot']) is bool))
+
+
+def _input_selection(columns):
+    # No display_metadata, admission text or arbitrary metadata is selected into raw.
+    def select(name):
+        if name not in columns:
+            return f'NULL AS "{name}"'
+        if name in ('display_kind', 'platform_message_id'):
+            return (f"CASE WHEN typeof(m.\"{name}\")='text' THEN CAST(m.\"{name}\" AS BLOB) "
+                    f'END AS "{name}"')
+        return f'm."{name}"'
+    return ', '.join(select(name) for name in (*_FIELDS, *_INPUT_FIELDS))
+
+
+def _admissions_supported(connection):
+    columns = {r[1] for r in connection.execute('PRAGMA table_info(session_admissions)')}
+    return {'target_session_id', 'request_id', 'payload_json', 'intent'} <= columns
+
+
+def _optional_text(value):
+    if isinstance(value, bytes):
+        try:
+            return value.decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+    return value
+
+
+def _capture_joins(connection, locators, columns):
+    """Bounded locator-only joins; at most one ledger-session scan per256 rows.
+
+    Native messages have (session_id,platform_message_id), but the admission
+    index leads with (target_session_id,status,seq), not request_id. Batch the
+    latter instead of walking one concentrated session for every user input.
+    Retain at most two candidates per requested pair, never a full-ledger cache.
+    Payloads are fetched only by unique physical rowid, one at a time.
+    """
+    if not {'message_uid', 'platform_message_id'} <= columns:
+        return {}
+    wanted = set()
+    for locator in locators:
+        metadata = connection.execute(
+            "SELECT session_id,role,message_uid,CASE WHEN typeof(platform_message_id)='text' "
+            "THEN CAST(platform_message_id AS BLOB) END "
+            'FROM messages WHERE rowid=?', (locator,)).fetchone()
+        if metadata is None:
+            raise SourceDenied('ACQUISITION_LOCATOR_MISSING')
+        session, role, uid, request = metadata
+        request = _optional_text(request)
+        if role == 'user' and _locator(uid) and _locator(request):
+            wanted.add((session, request))
+    if not wanted:
+        return {}
+    sessions = tuple({s for s, r in wanted})
+    requests = tuple({r for s, r in wanted})
+    def marks(values):
+        return ','.join('?' for _ in values)
+    params = (*sessions, *requests)
+    targets = {key: set() for key in wanted}
+    for session, request, uid, role in connection.execute(
+            "SELECT session_id,CAST(platform_message_id AS BLOB),CASE WHEN typeof(message_uid)='text' "
+            "THEN CAST(message_uid AS BLOB) END,role "
+            f'FROM messages WHERE session_id IN ({marks(sessions)}) '
+            f'AND platform_message_id IN ({marks(requests)})', params):
+        key = session, _optional_text(request)
+        if key in targets and len(targets[key]) < 2:
+            targets[key].add((_optional_text(uid), role))
+    admissions = {key: [] for key in wanted}
+    for rowid, session, request in connection.execute(
+            'SELECT rowid,target_session_id,CAST(request_id AS BLOB) '
+            f'FROM session_admissions WHERE target_session_id IN ({marks(sessions)}) '
+            f'AND request_id IN ({marks(requests)})', params):
+        key = session, _optional_text(request)
+        if key in admissions and len(admissions[key]) < 2:
+            admissions[key].append(rowid)
+    return {key: (next(iter(targets[key]))[0], rows[0]) for key, rows in admissions.items()
+            if len(rows) == 1 and len(targets[key]) == 1
+            and next(iter(targets[key]))[1] == 'user'}
+
+
+def _capture_input(connection, raw, joins):
+    """Source facts only; neither a human-input classifier nor an owner binding.
+
+    Qualified against Hermes 3b421578's native_text_v1 codec: ordinary snapshots
+    reject internal events; automation snapshots restore internal=True. The actual
+    event sender is separate from source.user_id and the dispatch principal.
+    Every lookup shares the message reader's existing read-only BEGIN snapshot.
+    """
+    summary = raw.pop('_compressed_summary')
+    if type(summary) is int and summary in (0, 1):
+        raw['_compressed_summary'] = bool(summary)
+    kind = _optional_text(raw.pop('display_kind'))
+    if isinstance(kind, str) and kind in _DISPLAY_KINDS:
+        raw['display_kind'] = kind
+    request = _optional_text(raw.pop('platform_message_id'))
+    if _locator(request):
+        raw['platform_message_id'] = request
+    uid = raw.get('message_uid')
+    match = joins.get((raw['session_id'], request))
+    if not (raw['role'] == 'user' and _locator(uid) and match and match[0] == uid):
+        return raw
+    encoded, intent = connection.execute(
+        "SELECT CASE WHEN typeof(payload_json)='text' AND length(CAST(payload_json AS BLOB))<=? "
+        'THEN CAST(payload_json AS BLOB) END,intent FROM session_admissions WHERE rowid=?',
+        (_ADMISSION_BYTES, match[1])).fetchone()
+    if not isinstance(encoded, bytes) or intent not in ('queue', 'steer', 'redirect'):
+        return raw
+    try:
+        payload = json.loads(encoded)
+    except (ValueError, RecursionError):
+        return raw
+    if (not isinstance(payload, dict) or set(payload) != {'text', 'native_text_v1'}
+            or not isinstance(payload['text'], str)):
+        return raw
+    envelope = payload['native_text_v1']
+    if not isinstance(envelope, dict):
+        return raw
+    source, event = envelope.get('source'), envelope.get('event')
+    if (not isinstance(source, dict) or not isinstance(event, dict)
+            or 'internal' in event):  # not an event field of the qualified native codec
+        return raw
+    platform = source.get('platform')
+    if (not isinstance(platform, str) or platform not in _INPUT_PLATFORMS
+            or event.get('message_id') != request):
+        return raw
+    automation = 'automation' in envelope
+    if automation and not isinstance(envelope['automation'], dict):
+        return raw
+    facts = {'basis': 'hermes.native_text_v1', 'join': 'same_session_request_id_message_uid',
+             'request_id': request, 'message_uid': uid, 'intent': intent, 'platform': platform,
+             'internal': automation, 'automation': automation}
+    if _locator(event.get('user_id')):
+        facts['sender_id'] = event['user_id']
+    if type(source.get('is_bot')) is bool:
+        facts['source_is_bot'] = source['is_bot']
+    raw['native_input'] = facts
+    return raw
+
+
+def legacy_capture_raw(data):
+    """Comparison only; remove supplemental capture fields, never other raw data.
+
+    Never send this projection or replace a retained original with it. An exact
+    legacy *wire* fingerprint match permits prospective-only capture upgrades.
+    """
+    from .hermes_reader import _decode
+    from .normalization import canonical
+
+    try:
+        raw = _decode(data)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    legacy = {k: v for k, v in raw.items() if k not in {*_INPUT_FIELDS, 'native_input'}}
+    return canonical(legacy) if legacy != raw else None
 
 
 def _parts(raw, limits):
@@ -99,8 +291,6 @@ def _native_rows(db_path: Path):
             if (not {"id", "session_id", "role", "content"} <= columns
                     or not {'id', 'source'} <= sessions):
                 raise SourceDenied("HERMES_SCHEMA_UNSUPPORTED")
-            selected = ", ".join(f'm."{name}"' if name in columns else f'NULL AS "{name}"'
-                                 for name in _FIELDS)
             # Sort only native row locators/order keys, not every raw payload.
             # rowid is indexed (the id alias in the native schema); each lookup
             # stays in this same BEGIN snapshot, including the sessions join.
@@ -108,13 +298,8 @@ def _native_rows(db_path: Path):
                 "SELECT m.rowid FROM messages AS m "
                 "ORDER BY MIN(m.id) OVER (PARTITION BY m.session_id), m.id"
             )
-            lookup = (f"SELECT {selected}, s.source FROM messages AS m "
-                      "LEFT JOIN sessions AS s ON s.id=m.session_id WHERE m.rowid=?")
-            for (rowid,) in cursor:
-                row = connection.execute(lookup, (rowid,)).fetchone()
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("SOURCE_READ_TIMEOUT")
-                yield dict(zip((*_FIELDS, "native_source"), row, strict=True))
+            for locator, raw in _frozen_rows(connection, (r[0] for r in cursor), deadline):
+                yield raw
         finally:
             connection.rollback()
             connection.close()
@@ -164,17 +349,18 @@ def incremental_rows(db_path: Path, *, after, through=None, limit=1000):
         if (not {'id', 'session_id', 'role', 'content', 'timestamp'} <= columns
                 or not {'id', 'source'} <= sessions):
             raise SourceDenied('HERMES_SCHEMA_UNSUPPORTED')
-        selected = ', '.join(f'm."{name}"' if name in columns else f'NULL AS "{name}"'
-                             for name in _FIELDS)
-        query = (f'SELECT {selected}, s.source, '
+        query = ('SELECT m.rowid, '
                  '(SELECT count(*) FROM messages p WHERE p.session_id=m.session_id AND p.id<m.id) '
-                 'FROM messages m LEFT JOIN sessions s ON s.id=m.session_id '
-                 'WHERE m.id>? AND m.id<=? ORDER BY m.id LIMIT ?')
+                 'FROM messages m WHERE m.id>? AND m.id<=? ORDER BY m.id LIMIT ?')
         maximum = through if through is not None else 2**63 - 1
-        for row in connection.execute(query, (after, maximum, limit)):
-            if time.monotonic() >= deadline:
-                raise SourceDenied('SOURCE_READ_TIMEOUT')
-            yield dict(zip((*_FIELDS, 'native_source'), row[:-1], strict=True)), row[-1]
+        cursor = connection.execute(query, (after, maximum, limit))
+        while positions := cursor.fetchmany(256):
+            selected = _frozen_rows(connection, (r[0] for r in positions), deadline)
+            try:
+                for (locator, raw), (_, seq) in zip(selected, positions, strict=True):
+                    yield raw, seq
+            finally:
+                selected.close()
     except sqlite3.DataError:
         raise SourceDenied('SOURCE_ROW_SIZE_LIMIT') from None
     finally:
@@ -228,19 +414,24 @@ def _frozen_rows(connection, locators, deadline):
     columns = {row[1] for row in connection.execute('PRAGMA table_info("messages")')}
     if not {'id', 'session_id', 'role', 'content'} <= columns:
         raise SourceDenied('HERMES_SCHEMA_UNSUPPORTED')
-    selected = ', '.join(f'm."{name}"' if name in columns else f'NULL AS "{name}"'
-                         for name in _FIELDS)
+    selected = _input_selection(columns)
+    admissions = _admissions_supported(connection)
     query = (f'SELECT {selected}, s.source FROM messages AS m '
              'LEFT JOIN sessions AS s ON s.id=m.session_id WHERE m.rowid=?')
-    for locator in locators:
-        if type(locator) is not int:
-            raise SourceDenied('ACQUISITION_LOCATOR_INVALID')
-        row = connection.execute(query, (locator,)).fetchone()
-        if row is None:
-            raise SourceDenied('ACQUISITION_LOCATOR_MISSING')
-        if time.monotonic() >= deadline:
-            raise SourceDenied('SOURCE_READ_TIMEOUT')
-        yield locator, dict(zip((*_FIELDS, 'native_source'), row, strict=True))
+    locators = iter(locators)
+    while page := list(islice(locators, 256)):
+        for locator in page:
+            if type(locator) is not int:
+                raise SourceDenied('ACQUISITION_LOCATOR_INVALID')
+        joins = _capture_joins(connection, page, columns) if admissions else {}
+        for locator in page:
+            row = connection.execute(query, (locator,)).fetchone()
+            if row is None:
+                raise SourceDenied('ACQUISITION_LOCATOR_MISSING')
+            if time.monotonic() >= deadline:
+                raise SourceDenied('SOURCE_READ_TIMEOUT')
+            raw = dict(zip((*_FIELDS, *_INPUT_FIELDS, 'native_source'), row, strict=True))
+            yield locator, _capture_input(connection, raw, joins)
 
 
 # Explicit human surfaces (gateway.session_policy.SURFACES and Platform values).

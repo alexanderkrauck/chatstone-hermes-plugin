@@ -73,6 +73,8 @@ def row_failure(error):
 
 
 def capture_id(spool, source, native_id, *, advance=None):
+    from chatstone.client.transport import ClientError
+
     from .errors import cause
     try:
         selected = list(incremental_rows(Path(source), after=native_id-1, through=native_id, limit=1))
@@ -88,12 +90,20 @@ def capture_id(spool, source, native_id, *, advance=None):
         prepared = None
     else:
         failure = None
-    # Cursor/skip ledger or payload/seen commit atomically. Never skip an
-    # admission failure (in particular SPOOL_FULL) or poison seen on failure.
+    # Cursor/skip ledger or payload/seen commit atomically. Only a comparison-only
+    # size refusal is skippable at admission; capacity/busy/I/O failures still block.
     try:
         with spool._transaction():
             if prepared is not None:
-                spool._add_prepared(prepared)
+                try:
+                    spool._add_prepared(prepared)
+                except ClientError as error:
+                    if prepared[2] is not None or error.code != 'REQUEST_TOO_LARGE':
+                        raise
+                    # The sentinel refuses before any pending/seen write.
+                    failure = cause(error, native_id=native_id)
+                    prepared = None
+            if prepared is not None:
                 spool._db.execute('DELETE FROM plugin_skipped WHERE native_id=?', (native_id,))
             else:
                 spool._db.execute('INSERT OR REPLACE INTO plugin_skipped VALUES (?,?)',

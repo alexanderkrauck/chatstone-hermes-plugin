@@ -9,6 +9,7 @@ No pruning of unacknowledged records or identity tombstones occurs.
 Only use a trusted directory owned by the current OS user: SQLite opens by path,
 so this is not protection from a malicious same-UID concurrent rename.
 """
+import base64
 import fcntl
 import hashlib
 import json
@@ -449,11 +450,22 @@ class Spool:
                 if error.code != 'REQUEST_TOO_LARGE':
                     raise
                 prepared = None
-            if group and (prepared is None or len(group) == 100
+            if group and (prepared is None or prepared[2] is None or len(group) == 100
                           or size + len(prepared[3]) > 1048576):
                 if not commit(group):
                     return result()
                 group, size, sequences = [], 0, {}
+            if prepared is not None and prepared[2] is None:
+                try:
+                    if not commit([(prepared, key, seq, ordinal)]):
+                        return result()
+                except ClientError as error:
+                    if error.code != 'REQUEST_TOO_LARGE':
+                        raise
+                    prepared = None
+                else:
+                    ordinal += 1
+                    continue
             if prepared is None:
                 try:
                     with self._transaction():
@@ -485,10 +497,29 @@ class Spool:
         if (message.source, message.host_id) != (self.source, self.host):
             raise ClientError('SPOOL_IDENTITY_MISMATCH')
         value = encode_record(record)
-        fingerprint = hashlib.sha256(encode_spool_json(value)).hexdigest()
         native = json.dumps([message.native_session_id, message.native_id], separators=(',', ':'))
         batch = str(uuid4())
-        body = encode_spool_json({'install_id': self.install_id, 'batch_id': batch, 'records': [value]})
+        try:
+            fingerprint = hashlib.sha256(encode_spool_json(value)).hexdigest()
+            body = encode_spool_json(
+                {'install_id': self.install_id, 'batch_id': batch, 'records': [value]})
+        except ClientError as error:
+            if (error.code != 'REQUEST_TOO_LARGE' or self.source != 'hermes'
+                    or hashlib.sha256(record.raw_record).hexdigest() != message.raw_hash):
+                raise
+            from chatstone.collectors.hermes import legacy_capture_raw
+
+            legacy = legacy_capture_raw(record.raw_record)
+            if legacy is None:
+                raise
+            value['raw_record_base64'] = base64.b64encode(legacy).decode('ascii')
+            value['message']['raw_hash'] = hashlib.sha256(legacy).hexdigest()
+            fingerprint = hashlib.sha256(encode_spool_json(value)).hexdigest()
+            body = encode_spool_json(
+                {'install_id': self.install_id, 'batch_id': batch, 'records': [value]})
+            # Bounded comparison ONLY. No seen lookup during preparation, and no
+            # stripped original may queue: a missing batch marks skip-or-refuse.
+            batch = None
         return native, fingerprint, batch, body
 
     def _add_prepared(self, prepared):
@@ -497,6 +528,20 @@ class Spool:
                                     (native,)).fetchone()
         if previous == (fingerprint,):
             return None
+        if batch is None:
+            raise ClientError('REQUEST_TOO_LARGE')
+        if self.source == 'hermes' and previous is not None:
+            from chatstone.collectors.hermes import legacy_capture_raw
+
+            # Compare at admission, under the same writer transaction, including
+            # repeated native IDs in an epoch group. Never rewrite old state/raws.
+            value = json.loads(body)['records'][0]
+            legacy = legacy_capture_raw(base64.b64decode(value['raw_record_base64']))
+            if legacy is not None:
+                value['raw_record_base64'] = base64.b64encode(legacy).decode('ascii')
+                value['message']['raw_hash'] = hashlib.sha256(legacy).hexdigest()
+                if previous == (hashlib.sha256(encode_spool_json(value)).hexdigest(),):
+                    return None
         if self._db.execute('SELECT count(*) FROM pending').fetchone()[0] >= self.max_pending:
             raise ClientError('SPOOL_FULL')
         self._db.execute('INSERT INTO pending(batch,payload) VALUES (?,?)', (batch, body))
@@ -567,7 +612,7 @@ class Spool:
                 if error.code != 'REQUEST_TOO_LARGE':
                     raise
                 prepared = None
-            if group and (prepared is None or len(group) == 100
+            if group and (prepared is None or prepared[2] is None or len(group) == 100
                           or size + len(prepared[3]) > 1048576):
                 outcomes = self._add_group(group)
                 yield from outcomes
@@ -576,6 +621,17 @@ class Spool:
                 group, size = [], 0
             if prepared is None:
                 yield None, 'REQUEST_TOO_LARGE'
+            elif prepared[2] is None:
+                try:
+                    outcomes = self._add_group([prepared])
+                except ClientError as error:
+                    if error.code != 'REQUEST_TOO_LARGE':
+                        raise
+                    yield None, error.code
+                else:
+                    yield from outcomes
+                    if outcomes[-1][1] == 'SPOOL_FULL':
+                        return
             else:
                 group.append(prepared)
                 size += len(prepared[3])

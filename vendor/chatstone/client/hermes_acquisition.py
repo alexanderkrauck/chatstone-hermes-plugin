@@ -613,14 +613,27 @@ def _order(path, state, deadline):
 
 
 def _raw(data):
-    from chatstone.collectors.hermes import _FIELDS
+    from chatstone.collectors.hermes import (
+        _DISPLAY_KINDS,
+        _FIELDS,
+        _INPUT_FIELDS,
+        _locator,
+        _valid_native_input,
+    )
     from chatstone.collectors.hermes_reader import _decode
 
     raw = _decode(data)
-    if set(raw) != {*_FIELDS, 'native_source'}:
+    required = {*_FIELDS, 'native_source'}
+    if not required <= raw.keys() <= required | {*_INPUT_FIELDS, 'native_input'}:
+        _deny('HERMES_SOURCE_INVALID')
+    if (('_compressed_summary' in raw and type(raw['_compressed_summary']) is not bool)
+            or ('display_kind' in raw and (not isinstance(raw['display_kind'], str)
+                                          or raw['display_kind'] not in _DISPLAY_KINDS))
+            or ('platform_message_id' in raw and not _locator(raw['platform_message_id']))
+            or ('native_input' in raw and not _valid_native_input(raw['native_input']))):
         _deny('HERMES_SOURCE_INVALID')
     if any(type(v) not in (type(None), str, bytes, int, float) or
-           (type(v) is float and not math.isfinite(v)) for v in raw.values()):
+           (type(v) is float and not math.isfinite(v)) for k, v in raw.items() if k in required):
         _deny('HERMES_SOURCE_INVALID')
     if canonical(raw) != data:
         _deny('HERMES_SOURCE_INVALID')
