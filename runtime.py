@@ -9,8 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from chatstone.client import hermes_incremental
+from chatstone.client.delivery import RetryingSpool as Spool
 from chatstone.client.ingest import IngestClient
-from chatstone.client.spool import Spool
 from chatstone.collectors.contracts import ParseLimits, SourceIdentity
 from chatstone.collectors.hermes import _parts, incremental_rows
 from chatstone.collectors.normalization import record
@@ -221,15 +221,16 @@ def continue_legacy(spool, source):
 
 
 def sync(config, *, seconds=25, one_step=False):
-    from time import monotonic, sleep
+    from time import monotonic
     end = monotonic()+seconds
     client = IngestClient(config['origin'], secret_getter=lambda: config['ingest_key'], timeout=10)
     client.ordered = True
     with open_spool(config) as spool:
         initialize(spool, config['source_path'])
+        spool.retry_after_update(Path(__file__).with_name('plugin.yaml').read_text())
         legacy = None
         steps = 0
-        while monotonic()+10 < end and (not one_step or steps == 0):
+        while monotonic() < end and (not one_step or steps == 0):
             steps += 1
             # Recheck on every bounded delivery/history step, not just once per tick.
             # Drain a multi-chunk live tail before admitting any history.
@@ -238,14 +239,12 @@ def sync(config, *, seconds=25, one_step=False):
             except Exception as error:
                 if str(error) != 'SPOOL_FULL':
                     raise
-            status = spool.status()
-            if status['pending']:
+            if spool.delivery_window():
                 spool.flush(client)
                 refused = spool.status()['errors']
                 if refused:
                     from chatstone.client.transport import ClientError
                     raise ClientError(next(iter(refused)))
-                sleep(.1)
                 continue
             tail = spool._db.execute('SELECT tail FROM hermes_fresh').fetchone()[0]
             top = bounds(config['source_path'], limit=1)

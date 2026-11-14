@@ -106,7 +106,22 @@ def status(home):
             phase = Acquisition(spool, Path(config['source_path'])).status()['phase']
     print('Device: '+config['device'])
     print('Last sync: '+str(saved.get('last_sync','not yet')))
-    print('Spool: '+json.dumps(counts, sort_keys=True))
+    print('Spool: '+str(counts['pending'])+' waiting; '+str(counts['rejected'])+
+          ' refused; '+str(counts['skipped'])+' skipped')
+    aside = counts.get('set_aside', {})
+    if aside.get('count'):
+        from datetime import UTC, datetime
+        reasons = {'SERVICE_UNAVAILABLE': 'server temporarily unavailable',
+                   'UPLOAD_BODY_TIMEOUT': 'too large for this connection',
+                   'DEADLINE_EXCEEDED': 'upload timed out', 'TRANSPORT_ERROR': 'connection unavailable',
+                   'REQUEST_TOO_LARGE': 'larger than the server allows'}
+        retry = counts.get('next_retry')
+        when = datetime.fromtimestamp(retry, UTC).isoformat() if retry else 'now'
+        print(str(aside['count'])+' upload'+('s' if aside['count'] != 1 else '')+' set aside: '+
+              ', '.join(reasons.get(code, code.lower().replace('_', ' '))+' ('+str(n)+')'
+                        for code, n in sorted(aside['reasons'].items()))+
+              '; largest '+str(aside['largest_bytes'])+' bytes; '+str(aside['max_attempts'])+
+              ' attempts; next automatic retry '+when)
     print('Backfill: '+str(row[1])+' admitted; remaining through native ID '+str(row[0])+
           (' (enabled)' if row[2] else ' (not started)'))
     metadata = counts['metadata']
@@ -226,6 +241,8 @@ def handle(args, home):
                     progress = result['backfill']
                     print('Backfill: '+str(progress['admitted'])+' admitted; remaining through ID '+
                         str(progress['remaining_through_id'])+'; pending '+str(result['pending']), flush=True)
+                    if not result.get('active_pending', result['pending']) and result.get('next_retry'):
+                        time.sleep(min(1, max(.1, result['next_retry']-time.time())))
                     if (not progress['remaining_through_id'] and not result['pending']
                             and not result['metadata']['remaining']
                             and progress.get('legacy_phase') in (None, 'RETIRED', 'FAILED', 'EXPIRED')):
