@@ -7,11 +7,12 @@ import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 
 from chatstone.client.spool import Spool
-from chatstone.client.transport import TOKEN, Client, ClientError
+from chatstone.client.transport import TOKEN, Client, ClientError, decode_json, encode_json
 
 from .config import load, read_private, root, write_private
 from .runtime import initialize, open_spool, retry_skipped, snapshot, sync
@@ -37,7 +38,7 @@ def lease(home, *, wait=False):
 
 
 def setup(parser):
-    parser.add_argument('action', choices=['login','backfill','status','diagnose','adopt-daemon','logout'])
+    parser.add_argument('action', choices=['login','backfill','resume','status','diagnose','adopt-daemon','logout'])
     parser.add_argument('--daemon-root', type=Path,
         help='Explicit older/custom daemon layout (never inferred from another Hermes profile)')
 
@@ -209,6 +210,60 @@ def adopt(home, old):
     print('Adopted device: '+config['device']+'; original identity/queue retained. Start a new Hermes session.')
 
 
+def _checked_resume_prefix(payload, header, spool, native):
+    from chatstone.client.ingest import _wire_record, identity
+    from chatstone.collectors.wire import decode_record
+
+    try:
+        identity(header['batch_id'])
+        prefix = encode_json(header)[:-1]+b',"records":'
+        if not isinstance(payload, bytes) or not payload.startswith(prefix):
+            raise ValueError
+        envelope = decode_json(payload)
+        records = envelope.pop('records', None)
+        if envelope == header and type(records) is list and len(records) == 1:
+            message = decode_record(_wire_record(records[0])).message
+            if ((message.source, message.host_id) == (spool.source, spool.host)
+                    and native == (json.dumps([message.native_session_id, message.native_id]),)):
+                return prefix
+    except (ClientError, ValueError):
+        pass  # Report a fixed local error, without the decoder's exception context.
+    raise ClientError('SPOOL_CORRUPT')
+
+
+def resume(home):
+    """Rearm at most the first refusal in the worker's current delivery window."""
+    rearmed = False
+    with open_spool(load(home)) as spool, spool._transaction():
+        db = spool._db
+        assert db is not None
+        for batch, payload, receipt in spool.delivery_window():
+            if receipt not in ('rejected', 'denied'):
+                continue  # Uncertain attempts keep their IDs and delivery positions.
+            code, = db.execute('SELECT code FROM pending WHERE batch=?', (batch,)).fetchone()
+            if code == 'QUOTA_EXCEEDED':
+                # The spool's canonical envelope starts with install_id and batch_id.
+                # Replace only that header; keep every record/original byte untouched.
+                header = {'install_id': spool.install_id, 'batch_id': batch}
+                native = db.execute('SELECT native FROM native_identity WHERE batch=?', (batch,)).fetchone()
+                prefix = _checked_resume_prefix(payload, header, spool, native)
+                new = str(uuid4())
+                header['batch_id'] = new
+                body = encode_json(header)[:-1]+b',"records":'+payload[len(prefix):]
+                db.execute("UPDATE pending SET batch=?,payload=?,receipt='pending',code=NULL "
+                           'WHERE batch=?', (new, body, batch))
+                db.execute('UPDATE native_priority SET batch=? WHERE batch=?', (new, batch))
+                db.execute('UPDATE native_identity SET batch=? WHERE batch=?', (new, batch))
+                db.execute('UPDATE native_blobs SET batch=? WHERE batch=?', (new, batch))
+                db.execute('DELETE FROM native_retry WHERE batch=?', (batch,))
+                rearmed = True
+            break  # Do not bypass a non-quota refusal or reset the entire queue.
+    if rearmed:
+        print('Queued 1 upload for retry locally. Nothing was sent; check hermes chatstone status.')
+    else:
+        print('No quota refusal eligible to resume now. Run hermes chatstone status to check the queue.')
+
+
 def handle(args, home):
     try:
         with lease(home, wait=True):
@@ -228,6 +283,8 @@ def handle(args, home):
                 status(home)
             elif args.action == 'diagnose':
                 diagnose(home)
+            elif args.action == 'resume':
+                resume(home)
             else:
                 config = load(home)
                 with open_spool(config) as spool:
@@ -248,13 +305,24 @@ def handle(args, home):
                             and progress.get('legacy_phase') in (None, 'RETIRED', 'FAILED', 'EXPIRED')):
                         break
     except KeyboardInterrupt:
-        print('Paused; durable queue/position retained. Rerun backfill to resume.')
+        if args.action == 'resume':
+            print('Resume interrupted. Run hermes chatstone status to check the local queue.')
+        else:
+            print('Paused; durable queue/position retained. Rerun backfill to resume.')
         return 130
     except Exception as error:  # noqa: BLE001 -- no secret exception text
         from .errors import BUSY_CODES, cause, describe, guidance, save_failure
-        if getattr(error, 'code', None) in BUSY_CODES:
+        code = getattr(error, 'code', None)
+        if code in BUSY_CODES:
+            if args.action == 'resume':
+                print('Chatstone: '+code+'. Queue busy; rerun hermes chatstone resume shortly.')
+                return 1
             return 0  # An existing sync owner will keep draining the live tail.
         value = cause(error)
+        if args.action == 'resume':
+            print('Chatstone: '+describe(value))
+            print('Resume could not be confirmed. Check hermes chatstone status; do not delete the queue.')
+            return 1
         try:
             save_failure(home, error)
         except Exception as saving_error:  # noqa: BLE001 -- content-free fallback

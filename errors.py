@@ -85,7 +85,10 @@ def save_failure(home, error):
 
 
 def guidance(code):
-    if code in ('INGEST_CAPACITY_EXCEEDED', 'QUOTA_EXCEEDED'):
+    if code == 'QUOTA_EXCEEDED':
+        return ('Server quota refused this upload. Queued data is kept. Ask the operator to restore '
+                'the allowance, then run hermes chatstone resume for a recorded quota refusal.')
+    if code == 'INGEST_CAPACITY_EXCEEDED':
         return ('Server capacity refused this upload. Queued data is kept. Ask the operator '
                 'to raise the device/tenant allowance or free server capacity; sync retries automatically.')
     if code in ('UNAUTHORIZED', 'FORBIDDEN', 'INVALID_KEY', 'KEY_REVOKED', 'INGEST_DISABLED'):
