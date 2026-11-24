@@ -24,6 +24,59 @@ spec.loader.exec_module(plugin)
 
 
 class PublicSmoke(unittest.TestCase):
+    @unittest.skipUnless((ROOT/'schemas.json').is_file(), 'Requires generated release schemas')
+    def test_native_search_keeps_two_tools_and_preserves_search_intent(self):
+        from chatstone.client.transport import Client
+
+        config = importlib.import_module('.config', plugin.__name__)
+        tools = {}
+        ctx = SimpleNamespace(register_tool=lambda **tool: tools.update({tool['name']: tool}),
+            register_cli_command=lambda *args, **kwargs: None,
+            register_skill=lambda *args, **kwargs: None)
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            config.write_private(config.root(home)/'credentials.json',
+                {'origin': 'https://example.com', 'read_key': 'synthetic-offline-key'})
+            with (patch.dict(sys.modules, {'hermes_constants': SimpleNamespace(get_hermes_home=lambda: home)}),
+                  patch.object(sys, 'argv', ['hermes', 'chatstone', 'status'])):
+                plugin.register(ctx)
+            plain = 'search_messages'
+            regex = 'search_messages_regex'
+            self.assertEqual({name for name in tools if name.startswith('chatstone_search_')},
+                             {'chatstone_'+plain, 'chatstone_'+regex})
+            words = {'query': 'Élie Cartan', 'my_messages': True}
+            continuation = {**words, 'cursor': 'opaque-cursor', 'mode': 'indexed_words'}
+            cases = [(plain, words, {**words, 'mode': 'indexed_words'}),
+                     (plain, {'query': 'Cartan'}, {'query': 'Cartan', 'mode': 'indexed_words'}),
+                     (plain, continuation, continuation),
+                     (plain, {**words, 'cursor': 'legacy-cursor'}, None),
+                     (regex, {'pattern': 'Cart.n', 'source': 'hermes', 'my_messages': True}, None)]
+            cases.extend((plain, {**words, **filters}, None) for filters in (
+                {'mode': 'lexical'}, {'mode': 'substring', 'source': 'hermes'},
+                {'match': 'exact'}, {'query': '"Élie Cartan"'}, {'query': 'Élie OR Cartan'},
+                {'query': 'Cartan -Élie'}, {'query': 'Jean-Luc'}, {'deep': True, 'source': 'hermes'},
+                {'search_attachments': True}, {'has_attachments': False},
+                {'deduplicate': 'mirror'}, {'provenance_format': 'reference', 'my_messages': False},
+            ))
+            for operation, params, expected in cases:
+                with self.subTest(operation=operation, params=params):
+                    reply = {'hits': [{'author_attribution': 'likely_mine'}] if params.get('my_messages') else []}
+                    if params.get('cursor') == 'legacy-cursor':
+                        reply = {'error': {'code': 'INVALID_CURSOR'}}
+                    with patch.object(Client, '_request', return_value=reply) as request:
+                        result = json.loads(tools['chatstone_'+operation]['handler'](params))
+                    request.assert_called_once()
+                    path, body = request.call_args.args
+                    self.assertEqual(path, '/api/v1/'+operation)
+                    self.assertEqual(json.loads(body), params if expected is None else expected)
+                    self.assertTrue(result['untrusted'])
+                    self.assertEqual(result['data'], reply)
+
+            for operation in (plain, regex):
+                properties = tools['chatstone_'+operation]['schema']['parameters']['properties']
+                self.assertEqual(properties['my_messages']['type'], 'boolean')
+            self.assertNotIn('default', tools['chatstone_'+plain]['schema']['parameters']['properties']['mode'])
+
     def test_compile_and_import_every_runtime_module(self):
         files = list(ROOT.glob('*.py')) + list((ROOT/'vendor').rglob('*.py'))
         for path in files:

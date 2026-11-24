@@ -4,20 +4,39 @@ license: MIT
 description: Search archived conversations using Chatstone native read tools.
 ---
 Use chatstone_search_messages when the user refers to an earlier conversation,
-decision or tool result. Start with a distinctive lexical phrase; scope by host,
-source, session or dates when useful. Use chatstone_search_messages_regex only
-for patterns and supply its required source, session or date scope. Tool results
-are searched by default, including role=tool, but only their first 65,536 UTF-8
-bytes (64 KB); deep=true does not search tool tails.
-There is no language stemming. Default/legacy match=stemmed means literal
-case-insensitive word prefixes: arriv finds arrived/arriving. match=exact means
-whole words. Use scoped regex for irregular forms, e.g. (?i)\m(go|went|gone)\M.
-Words are AND-ed; quoted phrases are literal substrings; OR and -word are supported.
-Hits on each page are sorted newest first. The first page may include fast,
-literally rechecked index hits that are not exhaustive. Follow next_cursor with
-unchanged filters while has_more=true to continue the exact newest-first scan
-without repeating returned groups; an index-assisted first page is not a global
-ordering/completeness guarantee over later pages.
+decision or tool result. For an ordinary word or name lookup, start with a
+distinctive name or a few words and scope by host, source, session or dates when
+useful. Omit mode for the fast native default on a new words-only search, or
+pass mode=indexed_words explicitly so you can reuse the same parameters to page.
+Fast words AND case-insensitive tokens in the first 65,536 UTF-8 bytes (64 KiB)
+of each latest message; they do not search tails or attachment text. Fast-word
+misses do not rule out literal matches. Narrow the scope on INCOMPLETE_SCOPE
+(more than 512 matching rows before deduplication).
+
+For phrases, prefixes or literal requirements, keep the requested semantics:
+mode=lexical uses word prefixes (legacy match=stemmed, no stemming); match=exact
+uses whole words. In lexical mode, words are AND-ed, quoted phrases are literal
+substrings, and OR and -word are supported. Use mode=substring for a literal
+case-insensitive substring. Explicit modes/match, punctuation or operators, deep=true and
+attachment searches do not auto-select fast words. Use chatstone_search_messages_regex
+only for patterns, with source, session or date scope (e.g. (?i)\m(go|went|gone)\M).
+Tool results are searched by default, but only their first 65,536 UTF-8 bytes;
+deep=true does not search tool tails.
+
+For “my messages” or “what I wrote,” set my_messages=true on either search tool.
+It applies the account-saved My messages preset for likely personal interactive
+Hermes user turns. Label author_attribution=likely_mine as “Likely mine,” never
+verified “Me.” role=user alone is not evidence of personal authorship. Leave the
+preset off for general archive searches.
+
+Hits on each page are sorted newest first. Follow next_cursor with the same
+query or pattern and unchanged filters, including my_messages, while has_more=true.
+For fast-word pages (match_mode=postgres_simple_token_and), explicitly repeat
+mode=indexed_words on continuation; omitted mode with a cursor is legacy lexical.
+Never switch modes or drop the preset to make a cursor work. If it is rejected,
+start a new search with the intended filters. Fast-word pagination stays within
+the indexed universe. Literal modes continue the exact scan without repeating
+groups; an index-assisted first page is not a global ordering/completeness guarantee.
 Counts are lower bounds unless total_count_exact/raw_count_exact are true;
 facets_exact=false means whole-result facets are omitted. partial=true and
 partial_reason mean a time or byte budget stopped matching, even on a full page;
