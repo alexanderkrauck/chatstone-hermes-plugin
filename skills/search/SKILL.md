@@ -10,8 +10,9 @@ useful. Omit mode for the fast native default on a new words-only search, or
 pass mode=indexed_words explicitly so you can reuse the same parameters to page.
 Fast words AND case-insensitive tokens in the first 65,536 UTF-8 bytes (64 KiB)
 of each latest message; they do not search tails or attachment text. Fast-word
-misses do not rule out literal matches. Narrow the scope on INCOMPLETE_SCOPE
-(more than 512 matching rows before deduplication).
+misses do not rule out literal matches. A frequent name with more than 512
+matching rows is answered with its newest whole-word matches in time-boxed pages
+(warning INDEXED_WORDS_DENSE): follow next_cursor, or add dates for a complete count.
 
 For phrases, prefixes or literal requirements, keep the requested semantics:
 mode=lexical uses word prefixes (legacy match=stemmed, no stemming); match=exact
@@ -55,6 +56,10 @@ originals and truncated text/pages mean attachment coverage is not exhaustive.
 get_attachment exposes extraction/OCR status and optional extracted_text:
 include_extracted_text=true by default, max_text_chars=20000 (maximum50000).
 OCR can misrecognize words; null confidence is unknown, not a quality guarantee.
+A hit's data.snippet is the start of the message; data.match_context, when present,
+is the passage around the first match: its zero-based start, the match at, total_chars.
+get_message returns at most 50,000 characters: when truncated=true, read on with
+offset_chars=text_start+len(text) to reach the rest of a long message.
 Read a selected hit with chatstone_get_message; reconstruct its thread with
 chatstone_get_session. Preserve source/host/session/message provenance in answers.
 Find chats with chatstone_list_sessions(kind=interactive, title=<substring>, host=<device>, source=hermes).

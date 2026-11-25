@@ -65,7 +65,14 @@ class PublicSmoke(unittest.TestCase):
                         reply = {'error': {'code': 'INVALID_CURSOR'}}
                     with patch.object(Client, '_request', return_value=reply) as request:
                         result = json.loads(tools['chatstone_'+operation]['handler'](params))
-                    request.assert_called_once()
+                    if params.get('cursor') == 'legacy-cursor':
+                        # A cursor the server refuses without a mode is offered once
+                        # more with the mode a plain first page would have chosen.
+                        self.assertEqual(request.call_count, 2)
+                        self.assertEqual(json.loads(request.call_args_list[0].args[1]), params)
+                        expected = {**params, 'mode': 'indexed_words'}
+                    else:
+                        request.assert_called_once()
                     path, body = request.call_args.args
                     self.assertEqual(path, '/api/v1/'+operation)
                     self.assertEqual(json.loads(body), params if expected is None else expected)
